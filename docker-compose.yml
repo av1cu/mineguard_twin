@@ -15,19 +15,17 @@ services:
       - PYTHONUNBUFFERED=1
 
   frontend:
-    build: .
+    build:
+      context: ./frontend-next
+      args:
+        NEXT_PUBLIC_BACKEND_URL: http://localhost:8000
     container_name: mineguard_frontend
-    command: streamlit run app/main.py --server.port 8501 --server.address 0.0.0.0
     ports:
-      - "8501:8501"
+      - "3000:3000"
     depends_on:
       - backend
-    volumes:
-      - ./app:/app/app
-      - ./frontend:/app/frontend
-      - ./data:/app/data
-      - ./cv_slope/models:/app/cv_slope/models
-      - ./cv_driver/models:/app/cv_driver/models
     environment:
-      - PYTHONUNBUFFERED=1
-      - BACKEND_URL=http://backend:8000
+      # Runs client-side in the user's browser (not container-to-container),
+      # so this must be a URL reachable from the host machine, not the
+      # in-network "backend" service name.
+      - NEXT_PUBLIC_BACKEND_URL=http://localhost:8000

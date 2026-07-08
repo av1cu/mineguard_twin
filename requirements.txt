@@ -1,6 +1,5 @@
 fastapi>=0.100.0
 uvicorn>=0.22.0
-streamlit>=1.25.0
 openmines>=0.1.0
 opencv-python-headless>=4.8.0
 mediapipe>=0.10.0
