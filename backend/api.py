@@ -33,8 +33,93 @@ sim_state = {
     "current_tick": 0,
     "dispatcher": "NaiveDispatcher",
     "run_id": "",
-    "max_ticks": 200
+    "max_ticks": 120
 }
+
+import threading
+import time
+
+class SimulationRunner:
+    def __init__(self):
+        self.sim = None
+        self.is_running = False
+        self.current_tick = 0
+        self.max_ticks = 120
+        self.dispatcher = "NaiveDispatcher"
+        self.run_id = ""
+        self.speed_rate = 1.0
+        self.thread = None
+        self.lock = threading.Lock()
+        
+    def start(self, dispatcher: str = "NaiveDispatcher", speed_rate: float = 1.0):
+        with self.lock:
+            self.dispatcher = dispatcher
+            self.speed_rate = speed_rate
+            
+            if not self.sim:
+                from simulation.openmines_adapter import MineSimulation
+                config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "simulation", "configs", "demo_mine.json")
+                self.sim = MineSimulation(config_path, dispatcher_name=dispatcher)
+                self.run_id = f"RUN-{uuid.uuid4().hex[:6].upper()}"
+                self.current_tick = 0
+                
+            self.is_running = True
+            
+            if self.thread is None or not self.thread.is_alive():
+                self.thread = threading.Thread(target=self._run_loop, daemon=True)
+                self.thread.start()
+                
+    def pause(self):
+        with self.lock:
+            self.is_running = False
+            
+    def reset(self):
+        with self.lock:
+            self.is_running = False
+            self.sim = None
+            self.current_tick = 0
+            self.run_id = ""
+            
+            # Reset SQLite state
+            from backend.database import get_connection
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute("UPDATE equipment_state SET risk_level = 'low', fatigue_score = 0, status = 'init'")
+            cursor.execute("UPDATE routes SET status = 'active', risk_level = 'low', blocked_reason = ''")
+            conn.commit()
+            conn.close()
+            
+    def set_speed(self, speed_rate: float):
+        with self.lock:
+            self.speed_rate = speed_rate
+            
+    def _run_loop(self):
+        while True:
+            with self.lock:
+                if not self.is_running:
+                    break
+                if self.current_tick >= self.max_ticks:
+                    self.is_running = False
+                    if self.sim:
+                        try:
+                            self.sim.save_run_kpis(self.run_id)
+                        except Exception as e:
+                            print("Error saving KPIs in simulation runner:", e)
+                    break
+                
+                try:
+                    self.sim.step()
+                except Exception as e:
+                    print("Error during simulation step in background:", e)
+                    self.is_running = False
+                    break
+                
+                self.current_tick += 1
+                delay = 1.0 / self.speed_rate
+                
+            time.sleep(delay)
+
+runner = SimulationRunner()
 
 # Ensure database is initialized on startup
 @app.on_event("startup")
@@ -147,42 +232,38 @@ def update_event_status(event_id: str, payload: EventStatusUpdate):
 # --- Simulation Endpoints ---
 
 @app.post("/api/simulation/start")
-def start_simulation(dispatcher: str = "NaiveDispatcher"):
-    global sim_state
-    sim_state["is_running"] = True
-    sim_state["current_tick"] = 0
-    sim_state["dispatcher"] = dispatcher
-    sim_state["run_id"] = f"RUN-{uuid.uuid4().hex[:6].upper()}"
-    
-    # Reset equipment status to idle/moving default states
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE equipment_state SET risk_level = 'low', fatigue_score = 0")
-    cursor.execute("UPDATE routes SET status = 'active', risk_level = 'low', blocked_reason = ''")
-    conn.commit()
-    conn.close()
-    
+def start_simulation(dispatcher: str = "NaiveDispatcher", speed: float = 1.0):
+    runner.start(dispatcher=dispatcher, speed_rate=speed)
     return {
         "status": "started",
-        "run_id": sim_state["run_id"],
+        "run_id": runner.run_id,
         "dispatcher": dispatcher
     }
 
 @app.post("/api/simulation/stop")
 def stop_simulation():
-    global sim_state
-    sim_state["is_running"] = False
-    return {"status": "stopped", "run_id": sim_state["run_id"]}
+    runner.pause()
+    return {"status": "stopped", "run_id": runner.run_id}
+
+@app.post("/api/simulation/reset")
+def reset_simulation():
+    runner.reset()
+    return {"status": "reset"}
+
+@app.post("/api/simulation/speed")
+def set_simulation_speed(speed: float):
+    runner.set_speed(speed)
+    return {"status": "speed_updated", "speed": speed}
 
 @app.get("/api/simulation/state")
 def get_simulation_state():
     global sim_state
-    # If simulation is running, we increment ticks and update states
-    if sim_state["is_running"]:
-        sim_state["current_tick"] += 1
-        if sim_state["current_tick"] >= sim_state["max_ticks"]:
-            sim_state["is_running"] = False
-            
+    sim_state["is_running"] = runner.is_running
+    sim_state["current_tick"] = runner.current_tick
+    sim_state["max_ticks"] = runner.max_ticks
+    sim_state["dispatcher"] = runner.dispatcher
+    sim_state["run_id"] = runner.run_id
+    
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -200,6 +281,7 @@ def get_simulation_state():
         "max_ticks": sim_state["max_ticks"],
         "dispatcher": sim_state["dispatcher"],
         "run_id": sim_state["run_id"],
+        "speed_rate": runner.speed_rate,
         "trucks": trucks,
         "routes": routes
     }
@@ -613,9 +695,15 @@ def stream_driver_frame(payload: dict):
                     try:
                         conn = get_connection()
                         cursor = conn.cursor()
+                        event_id = f"EVT-{uuid.uuid4().hex[:6].upper()}"
                         cursor.execute(
-                            "INSERT INTO events (timestamp, event_type, equipment_id, severity, description, status) VALUES (?, ?, ?, ?, ?, ?)",
-                            (datetime.utcnow().isoformat(), "driver_distraction", equipment_id, "high", f"Водитель отвлекся! (Направление: {gaze_label})", "active")
+                            """
+                            INSERT INTO events (
+                                event_id, event_time, source_module, event_type, risk_level, risk_score,
+                                equipment_id, driver_id, description, status
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (event_id, datetime.now().isoformat(), "driver_monitoring", "driver_distraction", "high", 80, equipment_id, f"DRIVER-{equipment_id[-2:]}", f"Водитель отвлекся! (Направление: {gaze_label})", "active")
                         )
                         cursor.execute(
                             "UPDATE equipment_state SET risk_level = 'high' WHERE equipment_id = ?",
@@ -647,9 +735,15 @@ def stream_driver_frame(payload: dict):
                 try:
                     conn = get_connection()
                     cursor = conn.cursor()
+                    event_id = f"EVT-{uuid.uuid4().hex[:6].upper()}"
                     cursor.execute(
-                        "INSERT INTO events (timestamp, event_type, equipment_id, severity, description, status) VALUES (?, ?, ?, ?, ?, ?)",
-                        (datetime.utcnow().isoformat(), "driver_fatigue", equipment_id, "critical", f"Водитель уставший! (PERCLOS: {perclos:.1f}%)", "active")
+                        """
+                        INSERT INTO events (
+                            event_id, event_time, source_module, event_type, risk_level, risk_score,
+                            equipment_id, driver_id, description, status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (event_id, datetime.now().isoformat(), "driver_monitoring", "driver_fatigue", "critical", int(perclos), equipment_id, f"DRIVER-{equipment_id[-2:]}", f"Водитель уставший! (PERCLOS: {perclos:.1f}%)", "active")
                     )
                     cursor.execute(
                         "UPDATE equipment_state SET risk_level = 'critical', fatigue_score = ? WHERE equipment_id = ?",

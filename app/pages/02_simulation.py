@@ -26,40 +26,32 @@ def run_simulation(dispatcher_type: str):
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    status_text.text("Инициализация окружения OpenMines...")
-    # Start on API
+    status_text.text("Инициализация окружения OpenMines на сервере...")
     try:
-        r = requests.post(f"{BACKEND_URL}/api/simulation/start?dispatcher={dispatcher_type}", timeout=2)
+        # Start on API with speed = 30.0 for quick dashboard run
+        r = requests.post(f"{BACKEND_URL}/api/simulation/start?dispatcher={dispatcher_type}&speed=30.0", timeout=2)
         if r.status_code != 200:
             st.error("Не удалось запустить симуляцию на бэкенде.")
             return False
         
-        run_data = r.json()
-        run_id = run_data["run_id"]
-        
-        # We will run 100 steps/ticks
-        from simulation.openmines_adapter import MineSimulation
-        config_path = "simulation/configs/demo_mine.json"
-        
-        sim = MineSimulation(config_path, dispatcher_name=dispatcher_type)
-        
-        # Advanced simulation loops
         total_ticks = 120
-        for tick in range(1, total_ticks + 1):
-            # Advance simulation step
-            sim.step()
+        while True:
+            # Poll state
+            state_r = requests.get(f"{BACKEND_URL}/api/simulation/state", timeout=1)
+            if state_r.status_code != 200:
+                break
+                
+            state = state_r.json()
+            tick = state.get("current_tick", 0)
+            is_running = state.get("is_running", False)
             
-            # Post progress to API
-            # For simplicity, we also notify the API to update tick count
-            requests.get(f"{BACKEND_URL}/api/simulation/state", timeout=1)
-            
-            # Update UI
-            progress_bar.progress(tick / total_ticks)
+            progress_bar.progress(min(tick / total_ticks, 1.0))
             status_text.text(f"Расчет тика симуляции: {tick} из {total_ticks} (Диспетчер: {dispatcher_type})")
-            time.sleep(0.02) # Fast forward simulation for presentation
             
-        # Save results to DB
-        sim.save_run_kpis(run_id)
+            if not is_running or tick >= total_ticks:
+                break
+            time.sleep(0.1)
+            
         status_text.success(f"Симуляция {dispatcher_type} успешно завершена! KPI сохранены в БД.")
         return True
     except Exception as e:

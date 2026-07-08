@@ -24,6 +24,7 @@ services:
       - backend
     volumes:
       - ./app:/app/app
+      - ./frontend:/app/frontend
       - ./data:/app/data
       - ./cv_slope/models:/app/cv_slope/models
       - ./cv_driver/models:/app/cv_driver/models
