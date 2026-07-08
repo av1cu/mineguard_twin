@@ -493,7 +493,9 @@ def stream_driver_frame(payload: dict):
             "ear_open": 0.28,
             "ear_window": [],
             "perclos_window": [],
-            "fatigue_triggered": False
+            "fatigue_triggered": False,
+            "distraction_triggered": False,
+            "distraction_frames": 0
         }
     session = live_sessions[equipment_id]
     
@@ -516,6 +518,8 @@ def stream_driver_frame(payload: dict):
     smoothed_ear = 0.0
     perclos = 0.0
     is_yawning = False
+    is_distracted = False
+    gaze_label = "AHEAD"
     
     if result.face_landmarks:
         face_landmarks = result.face_landmarks[0]
@@ -553,6 +557,80 @@ def stream_driver_frame(payload: dict):
             session["perclos_window"].pop(0)
         perclos = (sum(session["perclos_window"]) / len(session["perclos_window"])) * 100.0
 
+        # Gaze tracking (distraction detection)
+        p_nose = np.array([face_landmarks[1].x, face_landmarks[1].y])
+        p_eye_l = np.mean([np.array([face_landmarks[idx].x, face_landmarks[idx].y]) for idx in L_EYE_INDICES], axis=0)
+        p_eye_r = np.mean([np.array([face_landmarks[idx].x, face_landmarks[idx].y]) for idx in R_EYE_INDICES], axis=0)
+        dist_l = np.linalg.norm(p_nose - p_eye_l)
+        dist_r = np.linalg.norm(p_nose - p_eye_r)
+        head_yaw_ratio = dist_l / (dist_r + 1e-6)
+        
+        p_forehead = np.array([face_landmarks[10].x, face_landmarks[10].y])
+        p_chin = np.array([face_landmarks[152].x, face_landmarks[152].y])
+        dist_top = np.linalg.norm(p_forehead - p_nose)
+        dist_bottom = np.linalg.norm(p_chin - p_nose)
+        head_pitch_ratio = dist_top / (dist_bottom + 1e-6)
+        
+        has_iris = len(face_landmarks) > 473
+        gaze_ratio_l = 1.0
+        gaze_ratio_r = 1.0
+        
+        if has_iris:
+            p_pupil_l = np.array([face_landmarks[468].x, face_landmarks[468].y])
+            p_pupil_r = np.array([face_landmarks[473].x, face_landmarks[473].y])
+            p_corner_l_inner = np.array([face_landmarks[362].x, face_landmarks[362].y])
+            p_corner_l_outer = np.array([face_landmarks[263].x, face_landmarks[263].y])
+            p_corner_r_inner = np.array([face_landmarks[133].x, face_landmarks[133].y])
+            p_corner_r_outer = np.array([face_landmarks[33].x, face_landmarks[33].y])
+            
+            gaze_ratio_l = np.linalg.norm(p_pupil_l - p_corner_l_outer) / (np.linalg.norm(p_pupil_l - p_corner_l_inner) + 1e-6)
+            gaze_ratio_r = np.linalg.norm(p_pupil_r - p_corner_r_outer) / (np.linalg.norm(p_pupil_r - p_corner_r_inner) + 1e-6)
+            
+        if head_yaw_ratio > 1.38 or head_yaw_ratio < 0.72:
+            is_distracted = True
+            gaze_label = "LOOKING SIDEWAYS"
+        elif head_pitch_ratio > 1.45 or head_pitch_ratio < 0.65:
+            is_distracted = True
+            gaze_label = "LOOKING UP/DOWN"
+        elif has_iris and (gaze_ratio_l > 1.65 or gaze_ratio_l < 0.6 or gaze_ratio_r > 1.65 or gaze_ratio_r < 0.6):
+            is_distracted = True
+            gaze_label = "LOOKING SIDEWAYS"
+            
+        if is_distracted:
+            session["distraction_frames"] += 1
+            if session["distraction_frames"] >= 15:
+                if not session["distraction_triggered"]:
+                    try:
+                        conn = get_connection()
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "INSERT INTO events (timestamp, event_type, equipment_id, severity, description, status) VALUES (?, ?, ?, ?, ?, ?)",
+                            (datetime.utcnow().isoformat(), "driver_distraction", equipment_id, "high", f"Водитель отвлекся! (Направление: {gaze_label})", "active")
+                        )
+                        cursor.execute(
+                            "UPDATE equipment_state SET risk_level = 'high' WHERE equipment_id = ?",
+                            (equipment_id,)
+                        )
+                        conn.commit()
+                        conn.close()
+                    except Exception as e:
+                        print("Error logging distraction event to DB:", e)
+                    session["distraction_triggered"] = True
+        else:
+            session["distraction_frames"] = 0
+            if session["distraction_triggered"]:
+                try:
+                    conn = get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "UPDATE equipment_state SET risk_level = 'low' WHERE equipment_id = ?",
+                        (equipment_id,)
+                    )
+                    conn.commit()
+                    conn.close()
+                except:
+                    pass
+                session["distraction_triggered"] = False
         
         if perclos >= 25.0:
             if not session["fatigue_triggered"]:
@@ -608,7 +686,9 @@ def stream_driver_frame(payload: dict):
         "ear_open": session["ear_open"],
         "threshold_open": session["ear_open"] * 0.82,
         "threshold_closed": session["ear_open"] * 0.74,
-        "fatigue_triggered": session["fatigue_triggered"]
+        "fatigue_triggered": session["fatigue_triggered"],
+        "is_distracted": is_distracted,
+        "gaze_label": gaze_label
     }
 
 if __name__ == "__main__":

@@ -67,6 +67,11 @@ if mode == "📹 Живой видеопоток браузера (Рекоме�
           </div>
           
           <div style="margin-bottom: 15px; display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-size: 14px; color: #ccc;">Взгляд:</span>
+            <span id="txtGaze" style="padding: 4px 8px; border-radius: 4px; background: #444; font-weight: bold; font-size: 14px; text-transform: uppercase;">N/A</span>
+          </div>
+          
+          <div style="margin-bottom: 15px; display: flex; justify-content: space-between; align-items: center;">
             <span style="font-size: 14px; color: #ccc;">Сглаженный EAR:</span>
             <span id="txtEar" style="font-family: monospace; font-weight: bold; font-size: 16px;">0.000</span>
           </div>
@@ -83,6 +88,10 @@ if mode == "📹 Живой видеопоток браузера (Рекоме�
           
           <div id="alertBox" style="margin-top: 25px; padding: 12px; border-radius: 4px; display: none; text-align: center; font-weight: bold; font-size: 15px; animation: blinker 1.5s linear infinite;">
             🚨 ВОДИТЕЛЬ ЗАСЫПАЕТ!
+          </div>
+          
+          <div id="distractAlertBox" style="margin-top: 15px; padding: 12px; border-radius: 4px; display: none; text-align: center; font-weight: bold; font-size: 15px; background: #ff9800; color: white; animation: blinker 1.5s linear infinite;">
+            ⚠️ ВЗГЛЯД ОТВЕДЕН!
           </div>
         </div>
       </div>
@@ -105,6 +114,8 @@ if mode == "📹 Живой видеопоток браузера (Рекоме�
       const txtEar = document.getElementById('txtEar');
       const txtMar = document.getElementById('txtMar');
       const txtPerclos = document.getElementById('txtPerclos');
+      const txtGaze = document.getElementById('txtGaze');
+      const distractAlertBox = document.getElementById('distractAlertBox');
       const btnCalibrate = document.getElementById('btnCalibrate');
       const alertBox = document.getElementById('alertBox');
       
@@ -180,6 +191,18 @@ if mode == "📹 Живой видеопоток браузера (Рекоме�
                       txtEar.innerText = data.smoothed_ear.toFixed(3);
                       txtMar.innerText = (data.mar || 0).toFixed(3);
                       txtPerclos.innerText = data.perclos.toFixed(1) + '%';
+                      
+                      if (data.is_distracted) {
+                          txtGaze.innerText = data.gaze_label;
+                          txtGaze.style.background = '#f44336';
+                          txtGaze.style.color = 'white';
+                          distractAlertBox.style.display = 'block';
+                      } else {
+                          txtGaze.innerText = 'НА ДОРОГУ';
+                          txtGaze.style.background = '#4CAF50';
+                          txtGaze.style.color = 'white';
+                          distractAlertBox.style.display = 'none';
+                      }
                       
                       // Handle alert box
                       if (data.perclos >= 25.0) {
