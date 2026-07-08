@@ -8,7 +8,9 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      - ./backend:/app/backend
       - ./data:/app/data
+      - ./cv_driver/models:/app/cv_driver/models
     environment:
       - PYTHONUNBUFFERED=1
 
@@ -21,6 +23,7 @@ services:
     depends_on:
       - backend
     volumes:
+      - ./app:/app/app
       - ./data:/app/data
       - ./cv_slope/models:/app/cv_slope/models
       - ./cv_driver/models:/app/cv_driver/models

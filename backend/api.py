@@ -21,8 +21,8 @@ app = FastAPI(title="MineGuard Twin Backend API", version="1.0.0")
 # Enable CORS for frontend compatibility
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=["*", "null"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -406,6 +406,210 @@ def accept_recommendation(id: str):
     conn.commit()
     conn.close()
     return {"status": "accepted", "id": id}
+
+# --- Live Driver Webcam Stream ---
+import base64
+import cv2
+import numpy as np
+
+live_sessions = {}
+landmarker_instance = None
+
+def get_backend_landmarker():
+    global landmarker_instance
+    if landmarker_instance is None:
+        try:
+            import mediapipe as mp
+            from mediapipe.tasks import python
+            from mediapipe.tasks.python import vision
+            
+            model_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cv_driver", "models", "face_landmarker.task")
+            if not os.path.exists(model_path):
+                import urllib.request
+                url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+                os.makedirs(os.path.dirname(model_path), exist_ok=True)
+                urllib.request.urlretrieve(url, model_path)
+                
+            base_options = python.BaseOptions(model_asset_path=model_path)
+            options = vision.FaceLandmarkerOptions(
+                base_options=base_options,
+                running_mode=vision.RunningMode.IMAGE,
+                num_faces=1
+            )
+            landmarker_instance = vision.FaceLandmarker.create_from_options(options)
+        except Exception as e:
+            print(f"Error initializing backend landmarker: {e}")
+    return landmarker_instance
+
+L_EYE_INDICES = [362, 385, 387, 263, 373, 380]
+R_EYE_INDICES = [33, 160, 158, 133, 153, 144]
+
+def calculate_single_ear(landmarks, eye_indices) -> float:
+    p = [np.array([landmarks[idx].x, landmarks[idx].y]) for idx in eye_indices]
+    d_v1 = np.linalg.norm(p[1] - p[5])
+    d_v2 = np.linalg.norm(p[2] - p[4])
+    d_h = np.linalg.norm(p[0] - p[3])
+    return float((d_v1 + d_v2) / (2.0 * d_h + 1e-6))
+
+MOUTH_INDICES = [78, 308, 13, 14]
+
+def calculate_mar(landmarks, indices) -> float:
+    p_left = np.array([landmarks[indices[0]].x, landmarks[indices[0]].y])
+    p_right = np.array([landmarks[indices[1]].x, landmarks[indices[1]].y])
+    p_top = np.array([landmarks[indices[2]].x, landmarks[indices[2]].y])
+    p_bottom = np.array([landmarks[indices[3]].x, landmarks[indices[3]].y])
+    
+    d_v = np.linalg.norm(p_top - p_bottom)
+    d_h = np.linalg.norm(p_left - p_right)
+    return float(d_v / (d_h + 1e-6))
+
+@app.post("/api/driver/stream_frame")
+def stream_driver_frame(payload: dict):
+    img_data = payload.get("image")
+    equipment_id = payload.get("equipment_id", "TRUCK-04")
+    calibrate = payload.get("calibrate", False)
+    
+    if not img_data:
+        return {"success": False, "error": "No image data"}
+        
+    if "," in img_data:
+        img_data = img_data.split(",")[1]
+        
+    try:
+        img_bytes = base64.b64decode(img_data)
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    except Exception as e:
+        return {"success": False, "error": f"Decode error: {e}"}
+        
+    if frame is None:
+        return {"success": False, "error": "Frame is empty"}
+        
+    frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
+    
+    if equipment_id not in live_sessions:
+        live_sessions[equipment_id] = {
+            "ear_open": 0.28,
+            "ear_window": [],
+            "perclos_window": [],
+            "fatigue_triggered": False
+        }
+    session = live_sessions[equipment_id]
+    
+    landmarker = get_backend_landmarker()
+    if landmarker is None:
+        return {"success": False, "error": "MediaPipe Landmarker failed to load"}
+        
+    try:
+        import mediapipe as mp
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        result = landmarker.detect(mp_image)
+    except Exception as e:
+        return {"success": False, "error": f"Inference failed: {e}"}
+        
+    state_label = "N/A"
+    ear_l = 0.0
+    ear_r = 0.0
+    mar = 0.0
+    smoothed_ear = 0.0
+    perclos = 0.0
+    is_yawning = False
+    
+    if result.face_landmarks:
+        face_landmarks = result.face_landmarks[0]
+        ear_l = calculate_single_ear(face_landmarks, L_EYE_INDICES)
+        ear_r = calculate_single_ear(face_landmarks, R_EYE_INDICES)
+        ear_avg = (ear_l + ear_r) / 2.0
+        
+        mar = calculate_mar(face_landmarks, MOUTH_INDICES)
+        if mar > 0.5:
+            is_yawning = True
+            
+        if calibrate:
+            session["ear_open"] = ear_avg
+            
+        ear_open = session["ear_open"]
+        threshold_open = ear_open * 0.82
+        threshold_closed = ear_open * 0.74
+        
+        session["ear_window"].append(ear_avg)
+        if len(session["ear_window"]) > 8:
+            session["ear_window"].pop(0)
+        smoothed_ear = float(np.mean(session["ear_window"]))
+        
+        is_closed = False
+        if smoothed_ear >= threshold_open:
+            state_label = "OPEN"
+        elif smoothed_ear <= threshold_closed:
+            state_label = "CLOSED"
+            is_closed = True
+        else:
+            state_label = "PARTIALLY CLOSED"
+            
+        session["perclos_window"].append(1 if is_closed else 0)
+        if len(session["perclos_window"]) > 80:
+            session["perclos_window"].pop(0)
+        perclos = (sum(session["perclos_window"]) / len(session["perclos_window"])) * 100.0
+
+        
+        if perclos >= 25.0:
+            if not session["fatigue_triggered"]:
+                try:
+                    conn = get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "INSERT INTO events (timestamp, event_type, equipment_id, severity, description, status) VALUES (?, ?, ?, ?, ?, ?)",
+                        (datetime.utcnow().isoformat(), "driver_fatigue", equipment_id, "critical", f"Водитель уставший! (PERCLOS: {perclos:.1f}%)", "active")
+                    )
+                    cursor.execute(
+                        "UPDATE equipment_state SET risk_level = 'critical', fatigue_score = ? WHERE equipment_id = ?",
+                        (int(perclos), equipment_id)
+                    )
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    print("Error logging fatigue event to DB:", e)
+                session["fatigue_triggered"] = True
+        elif perclos < 10.0:
+            session["fatigue_triggered"] = False
+            
+        for lm in face_landmarks:
+            cx, cy = int(lm.x * w), int(lm.y * h)
+            cv2.circle(frame, (cx, cy), 1, (0, 255, 0), -1)
+            
+        for idx in L_EYE_INDICES + R_EYE_INDICES:
+            lm = face_landmarks[idx]
+            cx, cy = int(lm.x * w), int(lm.y * h)
+            cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
+            
+        for idx in MOUTH_INDICES:
+            lm = face_landmarks[idx]
+            cx, cy = int(lm.x * w), int(lm.y * h)
+            cv2.circle(frame, (cx, cy), 3, (255, 0, 0), -1)
+            
+    try:
+        _, buffer = cv2.imencode('.jpg', frame)
+        encoded_image = base64.b64encode(buffer).decode('utf-8')
+    except Exception as e:
+        return {"success": False, "error": f"Encode error: {e}"}
+        
+    return {
+        "success": True,
+        "image": f"data:image/jpeg;base64,{encoded_image}",
+        "state": state_label,
+        "ear_l": ear_l,
+        "ear_r": ear_r,
+        "mar": mar,
+        "is_yawning": is_yawning,
+        "smoothed_ear": smoothed_ear,
+        "perclos": perclos,
+        "ear_open": session["ear_open"],
+        "threshold_open": session["ear_open"] * 0.82,
+        "threshold_closed": session["ear_open"] * 0.74,
+        "fatigue_triggered": session["fatigue_triggered"]
+    }
 
 if __name__ == "__main__":
     import uvicorn
