@@ -495,7 +495,9 @@ def stream_driver_frame(payload: dict):
             "perclos_window": [],
             "fatigue_triggered": False,
             "distraction_triggered": False,
-            "distraction_frames": 0
+            "distraction_frames": 0,
+            "yaw_base": 1.0,
+            "pitch_base": 1.0
         }
     session = live_sessions[equipment_id]
     
@@ -531,9 +533,7 @@ def stream_driver_frame(payload: dict):
         if mar > 0.5:
             is_yawning = True
             
-        if calibrate:
-            session["ear_open"] = ear_avg
-            
+
         ear_open = session["ear_open"]
         threshold_open = ear_open * 0.82
         threshold_closed = ear_open * 0.74
@@ -571,6 +571,16 @@ def stream_driver_frame(payload: dict):
         dist_bottom = np.linalg.norm(p_chin - p_nose)
         head_pitch_ratio = dist_top / (dist_bottom + 1e-6)
         
+        # Save baseline during calibration
+        if calibrate:
+            session["ear_open"] = ear_avg
+            session["yaw_base"] = head_yaw_ratio
+            session["pitch_base"] = head_pitch_ratio
+            
+        # Calculate relative deviation from baseline
+        yaw_dev = head_yaw_ratio / (session["yaw_base"] + 1e-6)
+        pitch_dev = head_pitch_ratio / (session["pitch_base"] + 1e-6)
+        
         has_iris = len(face_landmarks) > 473
         gaze_ratio_l = 1.0
         gaze_ratio_r = 1.0
@@ -586,10 +596,10 @@ def stream_driver_frame(payload: dict):
             gaze_ratio_l = np.linalg.norm(p_pupil_l - p_corner_l_outer) / (np.linalg.norm(p_pupil_l - p_corner_l_inner) + 1e-6)
             gaze_ratio_r = np.linalg.norm(p_pupil_r - p_corner_r_outer) / (np.linalg.norm(p_pupil_r - p_corner_r_inner) + 1e-6)
             
-        if head_yaw_ratio > 1.38 or head_yaw_ratio < 0.72:
+        if yaw_dev > 1.25 or yaw_dev < 0.8:
             is_distracted = True
             gaze_label = "LOOKING SIDEWAYS"
-        elif head_pitch_ratio > 1.45 or head_pitch_ratio < 0.65:
+        elif pitch_dev > 1.3 or pitch_dev < 0.75:
             is_distracted = True
             gaze_label = "LOOKING UP/DOWN"
         elif has_iris and (gaze_ratio_l > 1.65 or gaze_ratio_l < 0.6 or gaze_ratio_r > 1.65 or gaze_ratio_r < 0.6):
