@@ -218,9 +218,86 @@ def render_page():
         /* Event alarm list */
         .alarms-block {
           padding: 16px;
-          max-height: 250px;
+          max-height: 180px;
           overflow-y: auto;
           background-color: #0c0f1d;
+          border-bottom: 1px solid #1f2937;
+        }
+        .recommendations-block {
+          padding: 16px;
+          max-height: 180px;
+          overflow-y: auto;
+          background-color: #0b132b;
+          border-bottom: 1px solid #1f2937;
+        }
+        .predictive-block {
+          padding: 16px;
+          max-height: 180px;
+          overflow-y: auto;
+          background-color: #1a0f05;
+        }
+        .pred-item {
+          padding: 8px;
+          border-radius: 4px;
+          margin-bottom: 6px;
+          font-size: 11px;
+          background-color: #2e1a05;
+          border: 1px solid #78350f;
+          animation: pulse-amber 2.5s infinite;
+        }
+        .pred-item-title {
+          font-weight: bold;
+          color: #f59e0b;
+          margin-bottom: 2px;
+          display: flex;
+          justify-content: space-between;
+        }
+        .pred-item-desc {
+          color: #fde68a;
+          margin-bottom: 4px;
+        }
+        .pred-meta {
+          font-size: 10px;
+          color: #d97706;
+          display: flex;
+          justify-content: space-between;
+          font-family: monospace;
+        }
+        @keyframes pulse-amber {
+          0% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.35); }
+          70% { box-shadow: 0 0 0 5px rgba(245, 158, 11, 0); }
+          100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0); }
+        }
+        .rec-item {
+          padding: 8px;
+          border-radius: 4px;
+          margin-bottom: 6px;
+          font-size: 11px;
+          background-color: #1e293b;
+          border: 1px solid #334155;
+        }
+        .rec-item-title {
+          font-weight: bold;
+          color: #38bdf8;
+          margin-bottom: 2px;
+          display: flex;
+          justify-content: space-between;
+        }
+        .rec-item-desc {
+          color: #cbd5e1;
+          margin-bottom: 4px;
+        }
+        .rec-effects {
+          font-family: monospace;
+          background-color: #0f172a;
+          padding: 3px 5px;
+          border-radius: 3px;
+          border: 1px solid #1e293b;
+          color: #34d399;
+          font-size: 10px;
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
         }
         .alarm-item {
           padding: 8px;
@@ -355,6 +432,18 @@ def render_page():
           <div class="alarms-block">
             <div class="panel-title" style="color: #ef4444;">⚠️ Лог тревог</div>
             <div id="alarmsList"></div>
+          </div>
+          
+          <!-- Recommendations Block -->
+          <div class="recommendations-block">
+            <div class="panel-title" style="color: #38bdf8;">🧠 Рекомендации (Rule Engine)</div>
+            <div id="recommendationsList"></div>
+          </div>
+          
+          <!-- Predictive Safety Warnings Block -->
+          <div class="predictive-block">
+            <div class="panel-title" style="color: #f59e0b;">🔮 Прогноз рисков (Predictive Safety)</div>
+            <div id="predictiveRisksList"></div>
           </div>
         </div>
       </div>
@@ -760,6 +849,41 @@ def render_page():
                 }
             }
             
+            // Draw predictive warning lines
+            if (window.activePredictiveRisks) {
+                window.activePredictiveRisks.forEach(r => {
+                    const t1 = trucksData[r.equipment1];
+                    const t2 = trucksData[r.equipment2];
+                    if (t1 && t2) {
+                        const pos1 = toCanvasCoords(t1.rx, t1.ry);
+                        const pos2 = toCanvasCoords(t2.rx, t2.ry);
+                        
+                        ctx.strokeStyle = '#f59e0b';
+                        ctx.lineWidth = 1.5;
+                        ctx.setLineDash([4, 4]);
+                        ctx.beginPath();
+                        ctx.moveTo(pos1.x, pos1.y);
+                        ctx.lineTo(pos2.x, pos2.y);
+                        ctx.stroke();
+                        ctx.setLineDash([]);
+                        
+                        const mx = (pos1.x + pos2.x) / 2;
+                        const my = (pos1.y + pos2.y) / 2;
+                        
+                        ctx.fillStyle = '#f59e0b';
+                        ctx.beginPath();
+                        ctx.arc(mx, my, 8, 0, Math.PI*2);
+                        ctx.fill();
+                        
+                        ctx.fillStyle = '#000000';
+                        ctx.font = 'bold 9px sans-serif';
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillText('⚠️', mx, my);
+                    }
+                });
+            }
+            
             ctx.restore();
         }
         
@@ -880,6 +1004,60 @@ def render_page():
                     alarmsContainer.innerHTML = alarmsHtml || '<div style="color: #4b5563; font-size: 11px; text-align: center; padding-top: 10px;">Нет активных тревог</div>';
                 })
                 .catch(err => console.error("Alarms fetch error:", err));
+                
+            // 3. Fetch Recommendations
+            fetch('{browser_api_url}/api/recommendations')
+                .then(res => res.json())
+                .then(recs => {
+                    const recsContainer = document.getElementById('recommendationsList');
+                    let recsHtml = "";
+                    recs.forEach(r => {
+                        recsHtml += `
+                          <div class="rec-item">
+                            <div class="rec-item-title">
+                              <span>💡 ${r.title}</span>
+                              <span style="font-size: 9px; color: #94a3b8; font-weight: normal;">${r.category}</span>
+                            </div>
+                            <div class="rec-item-desc">${r.description}</div>
+                            <div class="rec-effects">
+                              <div>⏱️ Цикл: ${r.effects.expected_cycle_time_change}</div>
+                              <div>⛽ Топливо: ${r.effects.expected_fuel_change}</div>
+                              <div>📈 Выработка: ${r.effects.expected_productivity_change}</div>
+                            </div>
+                          </div>
+                        `;
+                    });
+                    recsContainer.innerHTML = recsHtml || '<div style="color: #4b5563; font-size: 11px; text-align: center; padding-top: 10px;">Нет активных рекомендаций</div>';
+                })
+                .catch(err => console.error("Recommendations fetch error:", err));
+                
+            // 4. Fetch Predictive Risks
+            fetch('{browser_api_url}/api/predictive_risks')
+                .then(res => res.json())
+                .then(risks => {
+                    const predContainer = document.getElementById('predictiveRisksList');
+                    let predHtml = "";
+                    
+                    window.activePredictiveRisks = risks; // Saved globally for drawing lines
+                    
+                    risks.forEach(r => {
+                        predHtml += `
+                          <div class="pred-item">
+                            <div class="pred-item-title">
+                              <span>💥 Риск столкновения</span>
+                              <span>Степень: ${r.risk_score.toFixed(0)}%</span>
+                            </div>
+                            <div class="pred-item-desc">${r.equipment1} ↔️ ${r.equipment2}</div>
+                            <div style="font-size: 10px; color: #fbbf24; margin-top: 2px; margin-bottom: 2px;">🎯 ${r.recommendation}</div>
+                            <div class="pred-meta">
+                              <span>Прогноз: ${r.predicted_time}</span>
+                            </div>
+                          </div>
+                        `;
+                    });
+                    predContainer.innerHTML = predHtml || '<div style="color: #4b5563; font-size: 11px; text-align: center; padding-top: 10px;">Контроль дистанции в норме</div>';
+                })
+                .catch(err => console.error("Predictive risks fetch error:", err));
         }
         
         // Select Equipment Target

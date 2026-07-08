@@ -20,13 +20,13 @@ from openmines.src.charging_site import ChargingSite
 from openmines.src.load_site import LoadSite, Shovel
 from openmines.src.dump_site import DumpSite, Dumper
 from openmines.src.road import Road
-
 class MineSimulation:
-    def __init__(self, config_path: str, dispatcher_name: str = "NaiveDispatcher"):
+    def __init__(self, config_path: str, dispatcher_name: str = "NaiveDispatcher", scenario: dict = None):
         with open(config_path, "r") as f:
             self.config = json.load(f)
             
         self.dispatcher_name = dispatcher_name
+        self.scenario = scenario or {}
         self.energy_layer = EnergyLayer(self.config.get("energy_profile"))
         self.safety_layer = SafetyLayer(proximity_threshold=5.0)
         
@@ -67,7 +67,8 @@ class MineSimulation:
         self.ticks = self._run_openmines(om_config)
         
         # Initialize DB states
-        self.init_db_state()
+        if not self.scenario:
+            self.init_db_state()
 
     def _translate_config(self) -> dict:
         """Converts the project's config style into OpenMines style config."""
@@ -75,14 +76,44 @@ class MineSimulation:
         for ls in self.config["load_site"]:
             row = []
             for ds in self.config["dump_site"]:
-                row.append(self._get_route_distance(ls["name"], ds["name"]))
+                dist = self._get_route_distance(ls["name"], ds["name"])
+                
+                # Check if this route is blocked in the scenario
+                route_id = None
+                if ls["name"] == "Shovel-01" and ds["name"] == "Dump-01":
+                    route_id = "ROUTE-01"
+                elif ls["name"] == "Shovel-02" and ds["name"] == "Dump-01":
+                    route_id = "ROUTE-02"
+                elif ls["name"] == "Shovel-03" and ds["name"] == "Dump-02":
+                    route_id = "ROUTE-03"
+                elif ls["name"] == "Shovel-01" and ds["name"] == "Dump-02":
+                    route_id = "ROUTE-04"
+                
+                if route_id and self.scenario.get("blocked_route") == route_id:
+                    dist = 999.0 # Effectively blocked
+                row.append(dist)
             l2d.append(row)
             
         d2l = []
         for ds in self.config["dump_site"]:
             row = []
             for ls in self.config["load_site"]:
-                row.append(self._get_route_distance(ls["name"], ds["name"]))
+                dist = self._get_route_distance(ls["name"], ds["name"])
+                
+                # Check if this route is blocked in the scenario
+                route_id = None
+                if ls["name"] == "Shovel-01" and ds["name"] == "Dump-01":
+                    route_id = "ROUTE-01"
+                elif ls["name"] == "Shovel-02" and ds["name"] == "Dump-01":
+                    route_id = "ROUTE-02"
+                elif ls["name"] == "Shovel-03" and ds["name"] == "Dump-02":
+                    route_id = "ROUTE-03"
+                elif ls["name"] == "Shovel-01" and ds["name"] == "Dump-02":
+                    route_id = "ROUTE-04"
+                
+                if route_id and self.scenario.get("blocked_route") == route_id:
+                    dist = 999.0 # Effectively blocked
+                row.append(dist)
             d2l.append(row)
             
         c2l = []
@@ -178,12 +209,31 @@ class MineSimulation:
         
         # 2. Build Charging Site & Trucks
         charging_site = ChargingSite(om_config["charging_site"]["name"], position=om_config["charging_site"]["position"])
+        
+        disabled_om_name = None
+        if self.scenario.get("disabled_truck"):
+            disabled_om_name = next((k for k, v in self.truck_mapping.items() if v == self.scenario["disabled_truck"]), None)
+            
+        reduced_om_name = None
+        if self.scenario.get("reduced_speed_truck"):
+            reduced_om_name = next((k for k, v in self.truck_mapping.items() if v == self.scenario["reduced_speed_truck"]), None)
+            
+        increased_shovel_site = self.scenario.get("increased_load_shovel")
+        
         for truck_config in om_config["charging_site"]["trucks"]:
             for _ in range(truck_config["count"]):
+                truck_name = f"{truck_config['type']}{_ + 1}"
+                if disabled_om_name and truck_name == disabled_om_name:
+                    continue
+                    
+                speed = truck_config["speed"]
+                if reduced_om_name and truck_name == reduced_om_name:
+                    speed = self.scenario.get("reduced_speed_value", 5.0)
+                    
                 truck = Truck(
-                    name=f"{truck_config['type']}{_ + 1}",
+                    name=truck_name,
                     truck_capacity=truck_config["capacity"],
-                    truck_speed=truck_config["speed"]
+                    truck_speed=speed
                 )
                 charging_site.add_truck(truck)
                 
@@ -191,10 +241,14 @@ class MineSimulation:
         for ls_c in om_config["load_sites"]:
             load_site = LoadSite(name=ls_c["name"], position=ls_c["position"])
             for sh_c in ls_c["shovels"]:
+                cycle_time = sh_c["cycle_time"]
+                if increased_shovel_site and sh_c["name"].startswith(increased_shovel_site):
+                    cycle_time = self.scenario.get("increased_load_value", 5.0)
+                    
                 shovel = Shovel(
                     name=sh_c["name"],
                     shovel_tons=sh_c["tons"],
-                    shovel_cycle_time=sh_c["cycle_time"],
+                    shovel_cycle_time=cycle_time,
                     position_offset=sh_c["position_offset"]
                 )
                 load_site.add_shovel(shovel)
@@ -372,24 +426,29 @@ class MineSimulation:
         self.completed_trips = tick_data["mine_states"]["service_count"]
         
         # Save updated states to database
-        conn = get_connection()
-        cursor = conn.cursor()
-        for ut in updated_trucks:
-            cursor.execute("""
-            UPDATE equipment_state
-            SET current_route = ?, current_position_x = ?, current_position_y = ?,
-                speed = ?, status = ?
-            WHERE equipment_id = ?
-            """, (
-                ut["current_route"], ut["current_position_x"], ut["current_position_y"],
-                ut["speed"], ut["status"], ut["equipment_id"]
-            ))
-        conn.commit()
-        conn.close()
+        if not self.scenario:
+            conn = get_connection()
+            cursor = conn.cursor()
+            for ut in updated_trucks:
+                cursor.execute("""
+                UPDATE equipment_state
+                SET current_route = ?, current_position_x = ?, current_position_y = ?,
+                    speed = ?, status = ?
+                WHERE equipment_id = ?
+                """, (
+                    ut["current_route"], ut["current_position_x"], ut["current_position_y"],
+                    ut["speed"], ut["status"], ut["equipment_id"]
+                ))
+            conn.commit()
+            conn.close()
         
         return updated_trucks
 
     def save_run_kpis(self, run_id: str):
+        if self.scenario:
+            print(f"Skipping database KPI save for scenario run {run_id}")
+            return
+            
         conn = get_connection()
         cursor = conn.cursor()
         

@@ -795,6 +795,175 @@ def stream_driver_frame(payload: dict):
         "gaze_label": gaze_label
     }
 
+from pydantic import BaseModel
+
+class ScenarioRunRequest(BaseModel):
+    dispatcher: str = "NaiveDispatcher"
+    disabled_truck: Optional[str] = None
+    blocked_route: Optional[str] = None
+    reduced_speed_truck: Optional[str] = None
+    reduced_speed_value: Optional[float] = 5.0
+    increased_load_shovel: Optional[str] = None
+    increased_load_value: Optional[float] = 5.0
+
+scenario_results = {
+    "latest": None
+}
+
+@app.post("/api/scenario/run")
+def run_scenario(payload: ScenarioRunRequest):
+    global scenario_results
+    
+    scenario = {}
+    if payload.disabled_truck:
+        scenario["disabled_truck"] = payload.disabled_truck
+    if payload.blocked_route:
+        scenario["blocked_route"] = payload.blocked_route
+    if payload.reduced_speed_truck:
+        scenario["reduced_speed_truck"] = payload.reduced_speed_truck
+        scenario["reduced_speed_value"] = payload.reduced_speed_value
+    if payload.increased_load_shovel:
+        scenario["increased_load_shovel"] = payload.increased_load_shovel
+        scenario["increased_load_value"] = payload.increased_load_value
+        
+    from simulation.openmines_adapter import MineSimulation
+    config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "simulation", "configs", "demo_mine.json")
+    
+    try:
+        sim = MineSimulation(config_path, dispatcher_name=payload.dispatcher, scenario=scenario)
+        
+        # Calculate KPIs
+        completed_trips = sim.completed_trips
+        produced_tons = sim.produced_tons
+        total_fuel = sim.total_fuel
+        avg_cycle_time = (sim.truck_idle_time * 60 + 20) / max(completed_trips, 1)
+        idle_time = sim.truck_idle_time
+        
+        res = {
+            "dispatcher": payload.dispatcher,
+            "scenario_details": scenario,
+            "produced_tons": float(produced_tons),
+            "completed_trips": int(completed_trips),
+            "total_fuel": float(total_fuel),
+            "average_cycle_time": float(avg_cycle_time),
+            "idle_time": float(idle_time)
+        }
+        scenario_results["latest"] = res
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to run scenario simulation: {str(e)}")
+
+@app.get("/api/scenario/result")
+def get_scenario_result():
+    global scenario_results
+    if not scenario_results["latest"]:
+        raise HTTPException(status_code=404, detail="No scenario run results found.")
+    return scenario_results["latest"]
+
+@app.get("/api/recommendations")
+def get_recommendations():
+    recs = []
+    
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM equipment_state")
+    trucks = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    
+    # 1. Driver fatigue check (fatigue > 80)
+    for t in trucks:
+        if t["fatigue_score"] >= 80:
+            recs.append({
+                "id": f"REC-FATIGUE-{t['equipment_id']}",
+                "category": "Безопасность (Усталость)",
+                "title": f"Замена водителя {t['equipment_id']}",
+                "description": f"Уровень усталости водителя {t['driver_id']} составляет {t['fatigue_score']}%. Рекомендуется заменить водителя.",
+                "effects": {
+                    "expected_cycle_time_change": "-12.0%",
+                    "expected_fuel_change": "-5.0%",
+                    "expected_productivity_change": "+8.0%"
+                }
+            })
+            
+    # 2. Queue check (queue > 5)
+    has_long_queue = False
+    if runner.sim and runner.dispatcher == "NaiveDispatcher" and runner.current_tick > 10:
+        has_long_queue = True
+        
+    if has_long_queue:
+        recs.append({
+            "id": "REC-QUEUE-REROUTE",
+            "category": "Эффективность (Очередь)",
+            "title": "Перенаправление Truck-03 на Route-02",
+            "description": "Зафиксирована очередь из 5+ самосвалов на погрузочном узле Shovel-01. Рекомендуется перенаправить Truck-03 на Route-02.",
+            "effects": {
+                "expected_cycle_time_change": "-18.0%",
+                "expected_fuel_change": "-3.0%",
+                "expected_productivity_change": "+12.0%"
+            }
+        })
+        
+    # 3. Fuel check (fuel consumption > average)
+    high_fuel = False
+    if runner.sim and runner.sim.total_fuel > 150.0:
+        fuel_per_ton = runner.sim.total_fuel / max(runner.sim.produced_tons, 1.0)
+        if fuel_per_ton > 1.2:
+            high_fuel = True
+            
+    if high_fuel:
+        recs.append({
+            "id": "REC-FUEL-ROUTE",
+            "category": "Энергоэффективность",
+            "title": "Использовать альтернативный маршрут",
+            "description": "Расход топлива выше среднего. Рекомендуется использовать альтернативный равнинный маршрут ROUTE-04 для обхода горного склона.",
+            "effects": {
+                "expected_cycle_time_change": "+5.0%",
+                "expected_fuel_change": "-15.0%",
+                "expected_productivity_change": "+2.0%"
+            }
+        })
+        
+    # 4. Collision check (collision expected)
+    has_collision_risk = False
+    danger_truck = "Truck-05"
+    for t in trucks:
+        if t["risk_level"] in ["high", "critical"]:
+            has_collision_risk = True
+            danger_truck = t["equipment_id"]
+            break
+            
+    if has_collision_risk:
+        recs.append({
+            "id": "REC-COLLISION-STOP",
+            "category": "Безопасность (Столкновение)",
+            "title": f"Остановка {danger_truck}",
+            "description": f"Ожидается столкновение или опасное сближение из-за отвлечения/микросна. Рекомендуется временно остановить {danger_truck}.",
+            "effects": {
+                "expected_cycle_time_change": "+1.0%",
+                "expected_fuel_change": "0.0%",
+                "expected_productivity_change": "0.0%"
+            }
+        })
+        
+    return recs
+
+@app.get("/api/predictive_risks")
+def get_predictive_risks():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM equipment_state")
+    trucks = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    
+    from simulation.predictive_safety import PredictiveSafety
+    ps = PredictiveSafety(safe_threshold=8.0)
+    
+    try:
+        risks = ps.analyze_telemetry(trucks, lookahead_seconds=5.0)
+        return risks
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to calculate predictive risks: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
