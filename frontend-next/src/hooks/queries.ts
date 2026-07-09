@@ -9,6 +9,7 @@ import {
 import {
   acceptRecommendation,
   blockRoute,
+  getAgentShiftReport,
   getEquipment,
   getEvent,
   getEvents,
@@ -17,15 +18,20 @@ import {
   getRecommendations,
   getRoutes,
   getSimulationState,
+  postAgentChat,
+  postAgentWhatIf,
   resetSimulation,
+  resumeEquipment,
   runScenario,
   setSimulationSpeed,
   startSimulation,
+  stopEquipment,
   stopSimulation,
   unblockRoute,
   updateEventStatus,
 } from "@/lib/api";
 import type {
+  AgentChatRequest,
   EquipmentStateResponse,
   EventResponse,
   KPIResponse,
@@ -34,6 +40,7 @@ import type {
   RouteResponse,
   ScenarioRunRequest,
   SimulationStateResponse,
+  WhatIfAgentRequest,
 } from "@/types/api";
 
 const POLL_INTERVAL_MS = 500;
@@ -193,5 +200,41 @@ export function useUpdateEventStatus() {
 export function useRunScenario() {
   return useMutation({
     mutationFn: (payload: ScenarioRunRequest) => runScenario(payload),
+  });
+}
+
+// --- AI Agent (Decision Support System) ---
+
+export function useAgentChat() {
+  return useMutation({
+    mutationFn: (payload: AgentChatRequest) => postAgentChat(payload),
+  });
+}
+
+export function useAgentWhatIf() {
+  return useMutation({
+    mutationFn: (payload: WhatIfAgentRequest) => postAgentWhatIf(payload),
+  });
+}
+
+export function useAgentShiftReport() {
+  return useMutation({
+    mutationFn: () => getAgentShiftReport(),
+  });
+}
+
+export function useStopEquipment() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (equipmentId: string) => stopEquipment(equipmentId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["equipment"] }),
+  });
+}
+
+export function useResumeEquipment() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (equipmentId: string) => resumeEquipment(equipmentId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["equipment"] }),
   });
 }

@@ -165,3 +165,54 @@ export interface DriverStreamFrameResponse {
   is_distracted?: boolean;
   gaze_label?: string;
 }
+
+// --- AI Agent (Decision Support System) — mirrors agent/schemas.py ---
+// Additive layer on top of existing architecture. The agent only ever
+// *proposes* risky actions (proposed_actions); the dispatcher must click
+// Apply, which calls the existing/explicit mutation endpoints.
+
+export type ProposedActionType =
+  | "block_route"
+  | "unblock_route"
+  | "stop_equipment"
+  | "resume_equipment"
+  | "replace_driver";
+
+export interface ProposedAction {
+  type: ProposedActionType | string;
+  route_id?: string | null;
+  equipment_id?: string | null;
+  driver_id?: string | null;
+  reason?: string | null;
+  label?: string | null;
+}
+
+export interface AgentToolCallTrace {
+  tool: string;
+  args: Record<string, unknown>;
+  result_preview: string;
+}
+
+export interface AgentChatRequest {
+  message: string;
+  session_id?: string;
+}
+
+export interface AgentChatResponse {
+  answer: string;
+  proposed_actions: ProposedAction[];
+  trace: AgentToolCallTrace[];
+  session_id: string;
+}
+
+export interface WhatIfAgentRequest {
+  question: string;
+  session_id?: string;
+}
+
+export interface ShiftReportResponse {
+  report: string;
+  generated_at: string;
+  proposed_actions: ProposedAction[];
+  trace: AgentToolCallTrace[];
+}

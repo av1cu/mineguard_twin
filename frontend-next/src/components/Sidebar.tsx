@@ -11,11 +11,13 @@ import {
   Route as RouteIcon,
   Sliders,
   Eye,
+  Bot,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const NAV_ITEMS = [
   { href: "/dashboard", label: "Dashboard", icon: Gauge },
+  { href: "/agent", label: "AI Dispatcher", icon: Bot },
   { href: "/simulation", label: "Simulation", icon: Settings2 },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/events", label: "Events", icon: ListTree },

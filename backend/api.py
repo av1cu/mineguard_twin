@@ -1,10 +1,14 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import logging
 import uuid
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import os
 import sys
+
+logger = logging.getLogger(__name__)
 
 # Add parent directory to path to enable imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,6 +18,14 @@ from backend.schemas import (
     EventCreate, EventResponse, EventStatusUpdate,
     EquipmentStateResponse, EquipmentStateUpdate,
     RouteResponse, RouteBlockRequest, KPIResponse
+)
+
+# --- AI Agent layer (additive, does not modify existing architecture) ---
+from agent.agent_core import run_agent
+from agent.memory import get_conversation_memory
+from agent.prompts import get_system_prompt, SHIFT_REPORT_INSTRUCTIONS, WHATIF_INSTRUCTIONS
+from agent.schemas import (
+    AgentChatRequest, AgentChatResponse, WhatIfRequest, ShiftReportResponse, ProposedAction
 )
 
 app = FastAPI(title="MineGuard Twin Backend API", version="1.0.0")
@@ -26,6 +38,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# NOTE: FastAPI/Starlette gotcha - CORS headers are added by CORSMiddleware
+# while the response travels back *through* it, but an unhandled exception
+# is normally caught by an outer error-handling layer that sits *outside*
+# CORSMiddleware, so the resulting 500 response has no CORS headers at all.
+# Browsers then misreport this as "blocked by CORS policy" even though the
+# real problem is a server-side 500 (e.g. the agent's LLM call failing).
+# Registering an explicit exception handler routes the error response back
+# through CORSMiddleware like any other response, fixing the symptom; it
+# does not change behavior for any of the existing endpoints.
+@app.exception_handler(Exception)
+async def _cors_safe_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception in %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
+
 
 # Global Simulation Control State
 sim_state = {
@@ -963,6 +991,101 @@ def get_predictive_risks():
         return risks
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to calculate predictive risks: {str(e)}")
+
+# --- Equipment manual control (additive; needed so the AI agent's proposed
+# actions -- stop / resume equipment -- have a real "Apply" endpoint for the
+# dispatcher to click. Dangerous actions are never executed by the agent
+# itself, see agent/tools.py propose_* builders). ---
+
+@app.post("/api/equipment/{equipment_id}/stop", response_model=EquipmentStateResponse)
+def stop_equipment(equipment_id: str, reason: Optional[str] = None):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE equipment_state SET status = 'stopped' WHERE equipment_id = ?", (equipment_id,))
+    conn.commit()
+    cursor.execute("SELECT * FROM equipment_state WHERE equipment_id = ?", (equipment_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Equipment not found")
+    return dict(row)
+
+
+@app.post("/api/equipment/{equipment_id}/resume", response_model=EquipmentStateResponse)
+def resume_equipment(equipment_id: str, reset_risk: bool = True):
+    conn = get_connection()
+    cursor = conn.cursor()
+    if reset_risk:
+        cursor.execute(
+            "UPDATE equipment_state SET status = 'idle', risk_level = 'low', fatigue_score = 0 WHERE equipment_id = ?",
+            (equipment_id,),
+        )
+    else:
+        cursor.execute("UPDATE equipment_state SET status = 'idle' WHERE equipment_id = ?", (equipment_id,))
+    conn.commit()
+    cursor.execute("SELECT * FROM equipment_state WHERE equipment_id = ?", (equipment_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Equipment not found")
+    return dict(row)
+
+
+# --- AI Agent (Decision Support System) Endpoints -----------------------
+# Read-heavy, tool-calling agent built on top of the existing DB/simulation
+# layers (see agent/tools.py). It never mutates state directly: any risky
+# action it wants is surfaced as `proposed_actions`, and the dispatcher must
+# call the explicit apply endpoints above (or the pre-existing routes/block,
+# routes/unblock, recommendations/accept) to actually execute it.
+
+@app.post("/api/agent/chat", response_model=AgentChatResponse)
+async def agent_chat(payload: AgentChatRequest):
+    memory = get_conversation_memory()
+    history = memory.get(payload.session_id)
+
+    result = await run_agent(
+        system_prompt=get_system_prompt(),
+        user_message=payload.message,
+        history=history,
+    )
+
+    memory.add_turn(payload.session_id, "user", payload.message)
+    memory.add_turn(payload.session_id, "assistant", result.answer)
+
+    return AgentChatResponse(
+        answer=result.answer,
+        proposed_actions=[ProposedAction(**a) for a in result.proposed_actions],
+        trace=result.trace,
+        session_id=payload.session_id,
+    )
+
+
+@app.post("/api/agent/whatif", response_model=AgentChatResponse)
+async def agent_whatif(payload: WhatIfRequest):
+    system_prompt = get_system_prompt() + "\n\n" + WHATIF_INSTRUCTIONS
+    result = await run_agent(system_prompt=system_prompt, user_message=payload.question)
+    return AgentChatResponse(
+        answer=result.answer,
+        proposed_actions=[ProposedAction(**a) for a in result.proposed_actions],
+        trace=result.trace,
+        session_id=payload.session_id,
+    )
+
+
+@app.get("/api/agent/shift_report", response_model=ShiftReportResponse)
+async def agent_shift_report():
+    system_prompt = get_system_prompt() + "\n\n" + SHIFT_REPORT_INSTRUCTIONS
+    result = await run_agent(
+        system_prompt=system_prompt,
+        user_message="Составь отчёт за текущую смену.",
+    )
+    return ShiftReportResponse(
+        report=result.answer,
+        generated_at=datetime.now().isoformat(),
+        proposed_actions=[ProposedAction(**a) for a in result.proposed_actions],
+        trace=result.trace,
+    )
+
 
 if __name__ == "__main__":
     import uvicorn
